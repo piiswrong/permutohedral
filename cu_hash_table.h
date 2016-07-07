@@ -6,7 +6,7 @@
 namespace mxnet {
 namespace op {
 namespace permutohedral {
-
+#if defined(__CUDACC__)
 template<int key_size>
 class CuHashTable {
  public:
@@ -76,6 +76,7 @@ class CuHashTable {
   int32_t *entries_;
   int16_t *keys_;
 };
+#endif
 
 }
 }

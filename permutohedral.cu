@@ -6,7 +6,6 @@
 */
 
 #include "./permutohedral-inl.h"
-#include "cu_hash_table.h"
 
 namespace mxnet {
 namespace op {
@@ -112,7 +111,7 @@ __global__ void init(CuHashTable<key_size> table,
   }
 }
 
-template<int key_size, bool norm>
+template<int key_size, bool normalize>
 __global__ void splat(CuHashTable<key_size> table,
                       const int32_t n_elements,
                       const int32_t val_size,
@@ -125,7 +124,7 @@ __global__ void splat(CuHashTable<key_size> table,
 
   Pair r = matrix[idx*(key_size+1)+color];
   float *dst = val + r.index*val_size;
-  if (!norm) {
+  if (!normalize) {
     for (int j = 0; j < val_size; j++) {
       atomicAdd(dst+j, data[j*n_elements + idx]*r.weight);
     }
@@ -182,14 +181,15 @@ __global__ static void blur(CuHashTable<key_size> table,
   }
 }
 
-template<int key_size, bool norm>
+template<int key_size, bool normalize, bool save>
 __global__ void slice(CuHashTable<key_size> table,
                       const int32_t n_elements,
                       const int32_t val_size,
                       float *val,
                       float *out,
-                      Pair *matrix) {
-  const float alpha = 1.0f / (1+powf(2, -key_size));
+                      Pair *matrix,
+                      float *norm) {
+  const float alpha = 1.0f / (1+powf(2, -key_size-1));
   int32_t index[key_size+1];
   float weight[key_size+1];
 
@@ -202,7 +202,7 @@ __global__ void slice(CuHashTable<key_size> table,
     weight[i] = r.weight;
   }
 
-  if (!norm) {
+  if (!normalize) {
     for (int j = 0; j < val_size; ++j) {
       float v = 0.0f;
       for (int i = 0; i <= key_size; ++i) {
@@ -223,6 +223,114 @@ __global__ void slice(CuHashTable<key_size> table,
       }
       out[j*n_elements + idx] = v * n;
     }
+    if (save)
+      norm[idx] = n;
+  }
+}
+
+template<int key_size, bool normalize>
+__global__ void pos_grad_init(const int32_t n_elements, const int32_t val_size, 
+                              float *ograd, float *pos, float *data, float *out, float *norm, float *buf) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_elements) return;
+  float *f1 = buf;
+  float *f2 = f1 + key_size*val_size*n_elements;
+  float *f3 = f2 + val_size*n_elements;
+  float *f4 = f3 + key_size*val_size*n_elements;
+
+  float p[key_size];
+  for (int i = 0; i < key_size; ++i)
+    p[i] = pos[i*n_elements + idx];
+
+  float n;
+  if (normalize)
+    n = norm[idx];
+  float deltan = 0.f;
+
+  for (int j = 0; j < (normalize ? val_size - 1 : val_size); ++j) {
+    const int idx24 = j*n_elements + idx;
+    const float vj = data[idx24];
+    const float deltaj = normalize ? ograd[idx24]*n : ograd[idx24];
+
+    f2[idx24] = vj;
+    f4[idx24] = deltaj;
+
+    if (normalize)
+      deltan -= out[idx24]*deltaj;
+
+    for (int i = 0; i < key_size; ++i) {
+      const int idx13 = (i*val_size + j)*n_elements + idx;
+      f1[idx13] = p[i]*vj;
+      f3[idx13] = p[i]*deltaj;
+    }
+  }
+
+  if (normalize) {
+    const int idx24 = (val_size-1)*n_elements + idx;
+    const float vj = 1.f;
+
+    f2[idx24] = vj;
+    f4[idx24] = deltan;
+
+    for (int i = 0; i < key_size; ++i) {
+      const int idx13 = (i*val_size + val_size-1)*n_elements + idx;
+      f1[idx13] = p[i]*vj;
+      f3[idx13] = p[i]*deltan;
+    }
+  }
+}
+
+template<int key_size, bool normalize>
+__global__ void pos_grad_reduce(const int32_t n_elements, const int32_t val_size,
+                                float *ograd, float *pos, float *data, float *out,
+                                float *norm, float *buf, float *pgrad) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_elements) return;
+  float *f1 = buf;
+  float *f2 = f1 + key_size*val_size*n_elements;
+  float *f3 = f2 + val_size*n_elements;
+  float *f4 = f3 + key_size*val_size*n_elements;
+
+  float p[key_size];
+  float pg[key_size];
+  for (int i = 0; i < key_size; ++i) {
+    p[i] = pos[i*n_elements + idx];
+    pg[i] = 0;
+  }
+
+  float n;
+  if (normalize)
+    n = norm[idx];
+  float deltan = 0.f;
+
+  for (int j = 0; j < (normalize ? val_size - 1 : val_size); ++j) {
+    const int idx24 = j*n_elements + idx;
+    const float vj = data[idx24];
+    const float deltaj = normalize ? ograd[idx24]*n : ograd[idx24];
+
+    if (normalize)
+      deltan -= out[idx24]*deltaj;
+
+    for (int i = 0; i < key_size; ++i) {
+      const int idx13 = (i*val_size + j)*n_elements + idx;
+      pg[i] += deltaj*f1[idx13] - deltaj*p[i]*f2[idx24]
+               + vj*f3[idx13] - vj*p[i]*f4[idx24];
+    }
+  }
+
+  if (normalize) {
+    const int idx24 = (val_size-1)*n_elements + idx;
+    const float vj = 1.f;
+
+    for (int i = 0; i < key_size; ++i) {
+      const int idx13 = (i*val_size + val_size-1)*n_elements + idx;
+      pg[i] += deltan*f1[idx13] - deltan*p[i]*f2[idx24]
+               + vj*f3[idx13] - vj*p[i]*f4[idx24];
+    }
+  }
+
+  for (int i = 0; i < key_size; ++i) {
+    pgrad[i*n_elements + idx] = pg[i];
   }
 }
 
@@ -230,7 +338,7 @@ __global__ void slice(CuHashTable<key_size> table,
 
 
 template<int key_size>
-void CuPermutohedralOp<key_size>::GetTempSpace(const OpContext &ctx) {
+void CuPermutohedralOp<key_size>::GetTempSpace(const OpContext &ctx, int val_size) {
   using namespace mshadow;
   using namespace permutohedral;
   Stream<gpu> *s = ctx.get_stream<gpu>();
@@ -239,8 +347,8 @@ void CuPermutohedralOp<key_size>::GetTempSpace(const OpContext &ctx) {
     ctx.requested[kTemp].get_space_typed<gpu, 1, uint8_t>(
       Shape1(n_keys_*2*sizeof(int32_t) +
              n_keys_*key_size*sizeof(int16_t) +
-             n_keys_*val_size_*sizeof(float) +
-             n_keys_*val_size_*sizeof(float) +
+             n_keys_*val_size*sizeof(float) +
+             n_keys_*val_size*sizeof(float) +
              n_keys_*sizeof(Pair)), s);
   uint8_t *ptr = tmp.dptr_;
 
@@ -253,18 +361,57 @@ void CuPermutohedralOp<key_size>::GetTempSpace(const OpContext &ctx) {
   ptr += n_keys_*key_size*sizeof(int16_t);
 
   float *vals = (float*)ptr;
-  vals_ = Tensor<gpu, 2, float>(vals, Shape2(val_size_, n_keys_), s);
-  ptr += n_keys_*val_size_*sizeof(float);
+  vals_ = Tensor<gpu, 2, float>(vals, Shape2(val_size, n_keys_), s);
+  ptr += n_keys_*val_size*sizeof(float);
 
   float *new_vals = (float*)ptr;
-  new_vals_ = Tensor<gpu, 2, float>(new_vals, Shape2(val_size_, n_keys_), s);
-  ptr += n_keys_*val_size_*sizeof(float);
+  new_vals_ = Tensor<gpu, 2, float>(new_vals, Shape2(val_size, n_keys_), s);
+  ptr += n_keys_*val_size*sizeof(float);
 
   Pair *matrix = (Pair*)ptr;
   matrix_ = Tensor<gpu, 1, Pair>(matrix, Shape1(n_keys_), s);
   ptr += n_keys_*sizeof(Pair);
 
   CHECK_EQ(ptr, tmp.dptr_ + tmp.shape_.Size());
+}
+
+template<int key_size>
+void CuPermutohedralOp<key_size>::Filter(cudaStream_t stream, permutohedral::CuHashTable<key_size> table, bool normalize, int val_size,
+                                         float *scale, float *data, float *pos, float *out, float *norm) {
+  using namespace permutohedral;
+  
+  vals_ = 0;
+  if (normalize) {
+    splat<key_size, true><<<dim3(1, (n_elements_-1)/(lblock_/(key_size+1))+1, 1), dim3(key_size+1, lblock_/(key_size+1), 1), 0, stream>>>(
+      table, n_elements_, val_size, data, vals_.dptr_, matrix_.dptr_);
+  } else {
+    splat<key_size, false><<<dim3(1, (n_elements_-1)/(lblock_/(key_size+1))+1, 1), dim3(key_size+1, lblock_/(key_size+1), 1), 0, stream>>>(
+      table, n_elements_, val_size, data, vals_.dptr_, matrix_.dptr_);
+  }
+  CHECK_EQ(cudaGetLastError(), cudaSuccess);
+
+  float *pval = vals_.dptr_;
+  float *pnew_val = new_vals_.dptr_;
+  for (int j = 0; j <= key_size; ++j) {
+    blur<key_size><<<dim3((n_keys_-1)/lblock_+1, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+      table, val_size, j, pval, pnew_val, matrix_.dptr_);
+    CHECK_EQ(cudaGetLastError(), cudaSuccess);
+    std::swap(pval, pnew_val);
+  }
+
+  if (normalize) {
+    if (norm == NULL) {
+      slice<key_size, true, false><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+        table, n_elements_, val_size, pval, out, matrix_.dptr_, NULL);
+    } else {
+      slice<key_size, true, true><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+        table, n_elements_, val_size, pval, out, matrix_.dptr_, norm);
+    }
+  } else {
+    slice<key_size, false, false><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+      table, n_elements_, val_size, pval, out, matrix_.dptr_, NULL);
+  }
+  CHECK_EQ(cudaGetLastError(), cudaSuccess);
 }
 
 template<int key_size>
@@ -312,45 +459,28 @@ void CuPermutohedralOp<key_size>::Forward(const OpContext &ctx,
   Tensor<gpu, 3, float> out = out_data[kOut].get_with_shape<gpu, 3, float>(shape, s);
   shape[1] = key_size;
   Tensor<gpu, 3, float> pos = in_data[kPos].get_with_shape<gpu, 3, float>(shape, s);
+  shape[1] = 1;
+  Tensor<gpu, 3, float> norm = out_data[kNorm].get_with_shape<gpu, 3, float>(shape, s);
 
-  GetTempSpace(ctx);
+
+  GetTempSpace(ctx, val_size_);
 
   CuHashTable<key_size> table(n_keys_, entries_.dptr_, keys_.dptr_);
 
 
   for (int i = 0; i < batch_size_; ++i) {
     entries_ = -1;
-    vals_ = 0;
 
     init<key_size><<<dim3(nblock_, 1, 1), dim3(lblock_,1,1), 0, stream>>>(
       table, n_elements_, pos.dptr_ + i*key_size*n_elements_, scale.dptr_, matrix_.dptr_);
     CHECK_EQ(cudaGetLastError(), cudaSuccess);
-    if (param_.normalize) {
-      splat<key_size, true><<<dim3(1, (n_elements_-1)/(lblock_/(key_size+1))+1, 1), dim3(key_size+1, lblock_/(key_size+1), 1), 0, stream>>>(
-        table, n_elements_, val_size_, in.dptr_+i*data_size_*n_elements_, vals_.dptr_, matrix_.dptr_);
-    } else {
-      splat<key_size, false><<<dim3(1, (n_elements_-1)/(lblock_/(key_size+1))+1, 1), dim3(key_size+1, lblock_/(key_size+1), 1), 0, stream>>>(
-        table, n_elements_, val_size_, in.dptr_+i*data_size_*n_elements_, vals_.dptr_, matrix_.dptr_);
-    }
-    CHECK_EQ(cudaGetLastError(), cudaSuccess);
 
-    float *pval = vals_.dptr_;
-    float *pnew_val = new_vals_.dptr_;
-    for (int j = 0; j <= key_size; ++j) {
-      blur<key_size><<<dim3((n_keys_-1)/lblock_+1, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
-        table, val_size_, j, pval, pnew_val, matrix_.dptr_);
-      CHECK_EQ(cudaGetLastError(), cudaSuccess);
-      std::swap(pval, pnew_val);
-    }
-
-    if (param_.normalize) {
-      slice<key_size, true><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
-        table, n_elements_, val_size_, pval, out.dptr_ + i*data_size_*n_elements_, matrix_.dptr_);
-    } else {
-      slice<key_size, false><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
-        table, n_elements_, val_size_, pval, out.dptr_ + i*data_size_*n_elements_, matrix_.dptr_);
-    }
-    CHECK_EQ(cudaGetLastError(), cudaSuccess);
+    Filter(stream, table, param_.normalize, val_size_,
+           scale.dptr_,
+           in.dptr_+i*data_size_*n_elements_,
+           pos.dptr_ + i*key_size*n_elements_,
+           out.dptr_ + i*data_size_*n_elements_,
+           norm.dptr_ + i*n_elements_);
   }
 }
 
@@ -371,52 +501,94 @@ void CuPermutohedralOp<key_size>::Backward(const OpContext &ctx,
   Tensor<gpu, 1, float> scale = aux_args[kScale].get<gpu, 1, float>(s);
 
   Shape<3> shape = Shape3(batch_size_, data_size_, n_elements_); 
+  Tensor<gpu, 3, float> out = out_data[kOut].get_with_shape<gpu, 3, float>(shape, s);
   Tensor<gpu, 3, float> ograd = out_grad[kOut].get_with_shape<gpu, 3, float>(shape, s);
+  Tensor<gpu, 3, float> data = in_data[kData].get_with_shape<gpu, 3, float>(shape, s);
   Tensor<gpu, 3, float> data_grad = in_grad[kData].get_with_shape<gpu, 3, float>(shape, s);
   shape[1] = key_size;
   Tensor<gpu, 3, float> pos = in_data[kPos].get_with_shape<gpu, 3, float>(shape, s);
+  Tensor<gpu, 3, float> pos_grad = in_grad[kPos].get_with_shape<gpu, 3, float>(shape, s);
+  shape[1] = 1;
+  Tensor<gpu, 3, float> norm = out_data[kNorm].get_with_shape<gpu, 3, float>(shape, s);
 
-  GetTempSpace(ctx);
+  GetTempSpace(ctx, req[kPos] == kNullOp ? val_size_ : std::max(val_size_, 2*(key_size+1)*val_size_));
 
   CuHashTable<key_size> table(n_keys_, entries_.dptr_, keys_.dptr_);
 
   for (int i = 0; i < batch_size_; ++i) {
     entries_ = -1;
-    vals_ = 0;
-    
+
     init<key_size><<<dim3(nblock_, 1, 1), dim3(lblock_,1,1), 0, stream>>>(
       table, n_elements_, pos.dptr_ + i*key_size*n_elements_, scale.dptr_, matrix_.dptr_);
     CHECK_EQ(cudaGetLastError(), cudaSuccess);
-    if (param_.normalize) {
-      splat<key_size, true><<<dim3(1, (n_elements_-1)/(lblock_/(key_size+1))+1, 1), dim3(key_size+1, lblock_/(key_size+1), 1), 0, stream>>>(
-        table, n_elements_, val_size_, ograd.dptr_ + i*data_size_*n_elements_, vals_.dptr_, matrix_.dptr_);
-    } else {
-      splat<key_size, false><<<dim3(1, (n_elements_-1)/(lblock_/(key_size+1))+1, 1), dim3(key_size+1, lblock_/(key_size+1), 1), 0, stream>>>(
-        table, n_elements_, val_size_, ograd.dptr_ + i*data_size_*n_elements_, vals_.dptr_, matrix_.dptr_);
-    }
-    CHECK_EQ(cudaGetLastError(), cudaSuccess);
 
-    float *pval = vals_.dptr_;
-    float *pnew_val = new_vals_.dptr_;
-    for (int j = 0; j <= key_size; ++j) {
-      blur<key_size><<<dim3((n_keys_-1)/lblock_+1, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
-        table, val_size_, j, pval, pnew_val, matrix_.dptr_);
+    if (req[kData] != kNullOp) {
+      CHECK(req[kData] != kAddTo);
+      Filter(stream, table, param_.normalize, val_size_,
+             scale.dptr_,
+             ograd.dptr_ + i*data_size_*n_elements_,
+             pos.dptr_ + i*key_size*n_elements_,
+             data_grad.dptr_ + i*data_size_*n_elements_,
+             norm.dptr_ + i*n_elements_);
+    }
+
+    if (req[kPos] != kNullOp) {
+      CHECK(req[kData] != kAddTo);
+      if (param_.normalize) {
+        pos_grad_init<key_size, true><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+          n_elements_, val_size_,
+          ograd.dptr_ + i*data_size_*n_elements_,
+          pos.dptr_ + i*key_size*n_elements_,
+          data.dptr_ + i*data_size_*n_elements_,
+          out.dptr_ + i*data_size_*n_elements_,
+          norm.dptr_ + i*n_elements_,
+          new_vals_.dptr_);
+      } else {
+        pos_grad_init<key_size, false><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+          n_elements_, val_size_,
+          ograd.dptr_ + i*data_size_*n_elements_,
+          pos.dptr_ + i*key_size*n_elements_,
+          data.dptr_ + i*data_size_*n_elements_,
+          out.dptr_ + i*data_size_*n_elements_,
+          NULL,
+          new_vals_.dptr_);
+      }
       CHECK_EQ(cudaGetLastError(), cudaSuccess);
-      std::swap(pval, pnew_val);
-    }
 
-    if (param_.normalize) {
-      slice<key_size, true><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
-        table, n_elements_, val_size_, pval, data_grad.dptr_ + i*data_size_*n_elements_, matrix_.dptr_);
-    } else {
-      slice<key_size, false><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
-        table, n_elements_, val_size_, pval, data_grad.dptr_ + i*data_size_*n_elements_, matrix_.dptr_);
+      Filter(stream, table, false, 2*(key_size+1)*val_size_,
+             scale.dptr_,
+             new_vals_.dptr_,
+             pos.dptr_ + i*key_size*n_elements_,
+             key_size%2 ? new_vals_.dptr_ : vals_.dptr_,
+             NULL);
+
+      if (param_.normalize) {
+        pos_grad_reduce<key_size, true><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+          n_elements_, val_size_,
+          ograd.dptr_ + i*data_size_*n_elements_,
+          pos.dptr_ + i*key_size*n_elements_,
+          data.dptr_ + i*data_size_*n_elements_,
+          out.dptr_ + i*data_size_*n_elements_,
+          norm.dptr_ + i*n_elements_,
+          key_size%2 ? new_vals_.dptr_ : vals_.dptr_,
+          pos_grad.dptr_ + i*key_size*n_elements_);
+      } else {
+        pos_grad_reduce<key_size, false><<<dim3(nblock_, 1, 1), dim3(lblock_, 1, 1), 0, stream>>>(
+          n_elements_, val_size_,
+          ograd.dptr_ + i*data_size_*n_elements_,
+          pos.dptr_ + i*key_size*n_elements_,
+          data.dptr_ + i*data_size_*n_elements_,
+          out.dptr_ + i*data_size_*n_elements_,
+          NULL,
+          key_size%2 ? new_vals_.dptr_ : vals_.dptr_,
+          pos_grad.dptr_ + i*key_size*n_elements_);
+      }
+      CHECK_EQ(cudaGetLastError(), cudaSuccess);
     }
-    CHECK_EQ(cudaGetLastError(), cudaSuccess);
   }
 }
 
-  
+
 template<>
 Operator *CreateOp<gpu>(PermutohedralParam param, int key_size) {
   switch (key_size) {

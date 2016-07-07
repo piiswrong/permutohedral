@@ -16,13 +16,14 @@
 #include "../../src/operator/mshadow_op.h"
 #include "../../src/operator/operator_common.h"
 #include "modified_permutohedral.h"
+#include "cu_hash_table.h"
 
 namespace mxnet {
 namespace op {
 
 namespace permutohedral {
 enum PermutohedralOpInputs {kData, kPos};
-enum PermutohedralOpOutputs {kOut};
+enum PermutohedralOpOutputs {kOut, kNorm};
 enum PermutohedralOpTemps {kTemp};
 enum PermutohedralOpAuxs {kScale};
 
@@ -64,6 +65,7 @@ class PermutohedralOp : public Operator {
   permutohedral::ModifiedPermutohedral lattice_;
 };  // class PermutohedralOp
 
+#if defined(__CUDACC__)
 template<int key_size>
 class CuPermutohedralOp : public Operator {
  public:
@@ -95,9 +97,12 @@ class CuPermutohedralOp : public Operator {
   mshadow::Tensor<gpu, 2, int16_t> keys_;
   mshadow::Tensor<gpu, 2, float> vals_, new_vals_;
   mshadow::Tensor<gpu, 1, permutohedral::Pair> matrix_;
-  void GetTempSpace(const OpContext &ctx);
+  void GetTempSpace(const OpContext &ctx, int val_size);
+  void Filter(cudaStream_t stream, permutohedral::CuHashTable<key_size> table, bool normalize, int val_size,
+              float *scale, float *data, float *pos, float *out, float *norm);
 
 };  // class PermutohedralOp
+#endif  // __CUDACC__
 
 template<typename xpu>
 Operator *CreateOp(PermutohedralParam param, int key_size);
@@ -121,19 +126,33 @@ class PermutohedralProp : public OperatorProperty {
     return {"bias"};
   }
 
+  std::vector<std::string> ListOutputs() const override {
+    return {"output", "norm"};
+  }
+
+  int NumVisibleOutputs() const override {
+    return 1;
+  }
+
+  int NumOutputs() const override {
+    return 2;
+  }
+
   bool InferShape(std::vector<TShape> *in_shape,
                   std::vector<TShape> *out_shape,
                   std::vector<TShape> *aux_shape) const override {
     using namespace mshadow;
     CHECK_EQ(in_shape->size(), 2);
-    const TShape &val_shape = in_shape->at(permutohedral::kData);
-    const TShape &pos_shape = in_shape->at(permutohedral::kPos);
+    TShape val_shape = in_shape->at(permutohedral::kData);
+    TShape pos_shape = in_shape->at(permutohedral::kPos);
     CHECK_EQ(val_shape.ndim(), 4);
     CHECK_EQ(pos_shape.ndim(), 4);
     CHECK_EQ(val_shape[0], pos_shape[0]);
     CHECK_EQ(val_shape[2], pos_shape[2]);
     CHECK_EQ(val_shape[3], pos_shape[3]);
     out_shape->clear();
+    out_shape->push_back(val_shape);
+    val_shape[1] = 1;
     out_shape->push_back(val_shape);
     aux_shape->clear();
     aux_shape->push_back(Shape1(pos_shape[1]));
@@ -165,7 +184,10 @@ class PermutohedralProp : public OperatorProperty {
     const std::vector<int> &in_data,
     const std::vector<int> &out_data) const override {
     return {out_grad[permutohedral::kOut],
-            in_data[permutohedral::kPos]
+            in_data[permutohedral::kData],
+            in_data[permutohedral::kPos],
+            out_data[permutohedral::kOut],
+            out_data[permutohedral::kNorm]
            };
   }
 
